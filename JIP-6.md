@@ -253,5 +253,4 @@ We attach hashes with the proof.
 With query being a sequence of key and ranges. Key and ranges must b deduplicated (no key in ranges), and ordered.
 
 key should match an elided node, one and only one if there is a value attached, or an added empty node on the path.
-range, from starting key to end key resolved to one elided set of node if start key equal to end key or to two elided set of node (start to common prefix, common prefix to end, with common prefix between start and end).
-Again elided sets of node must match those of the proof (or have an empty node in their path).
+range, from starting key to end key resolved to multiple elided set of node if node is between start key equal and end key.
