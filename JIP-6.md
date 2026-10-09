@@ -95,6 +95,17 @@ The `sequences_sizes` are compact size in bytes of each sequence in order.
 
 The `structure` and `structure_sizes` sections lists all the tree path to descend into (from root
 to leaf) during the verification iteration.
+`structure_sizes` are encoded on one bit and can take 0 to 31 * 8 as value.
+
+A specific value is reserved
+for the case where we want to prove a key is missing, but part of the key path is into the partial key
+of another node (in this case we need to board the value node to the proof: partial key and hash).
+So structure size of 255 indicates next structure bytes is followed by the value node target len and the 
+partial key of a key value (len would be 31*8 - target depth), the partial key is then read from `structure`
+section, and the attached hash (either inline value or hash of value) is consumed from the `hashes` section.
+This case uses a full byte to be signaled, but is seen as not too common. 
+TODO add this to the algo TODO alternatively can add if structure has attached value in a sequence of bits.
+
 
 If content to be proven is a present single key value, we shall therefore descend up to its value node hash (248
 bits minus its value node partial key length).
@@ -152,16 +163,25 @@ verification).
 The verification run as:
 
     stack = empty, path = empty, missing_elided_hash = empty_hash, target_len = 0, common_depth_up = 0, proven_root = empty_hash
+    need_value_node_partial = false
     content_to_be_proven = consume first content to be proven
     loop:
-        target_len = consume one bytes from structure_sizes and adds it to current length of path
+        target_len, need_value_node_partial = consume one bytes from structure_sizes and adds it to current length of path
+           if size read is 255 set need_value_node_partial to true and update target_len from next bytes.
         loop:
             if length of current path in bits equals to target_len
                if content_to_be_proven matches current path
                    missing_elided_hash = with current content_to_be_proven gets its hash (either partialkey and
                    value hash) or full subtree of a range hash (in this case the current stack and path should be used)
                 else
-                    missing_elided_hash = empty_hash
+                    if need_value_node_to_be_proven
+                       partial_len = 31 * 8 - target_len
+                       partial = consume partial_len bits from structure
+                       assert partial do not point on value deemed missing (or invalid proof)
+                       value_hash = consume one hash for section hashes
+                       missing_elided_hash = hash(value_node(partialkey, value_hash))
+                    else
+                       missing_elided_hash = empty_hash
                 break from loop
             else
                next_bit = consume one bit forme structure sequence
