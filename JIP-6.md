@@ -13,12 +13,13 @@ trie during verification.
 
 The proof defined here is designed for this smaller, selective access pattern. The requested keys
 and values travel beside the proof, not inside it. The proof holds only the trie structure, the
-hashes of the subtrees it does not open, and the few leaves the verifier needs but did not ask
-for. The verifier rebuilds every other subtree from the requested keys and values.
+hashes of the subtrees it does not open. The verifier rebuilds every other subtree from the
+requested keys and values.
 
 One proof covers multiple keys and ranges, and proves both presence and absence. It is verified in
-a single pass with a stack. For a range, its size grows with the depth of the trie, not with the
-number of keys in the range.
+a single pass over a single hash stack.
+
+Verification is done over a single iteration on content.
 
 The proof format is independent of its transport and may be used by any protocol.
 
@@ -61,27 +62,16 @@ that the verifier already holds.
 
 ## Proof subtree
 
-A proof subtree is a part of the state trie that contains the root and, for every other node in it,
-the node's parent. Each node of a proof subtree has one of four tags:
+A proof subtree is a part of the state trie that allows rebuilding a partial tree, with both:
+- elided subtree with hash, only the hash is known
+- elided subtree without hash. The hash is infer from the data to be proven:
+    - empty subtree if undefined
+    - value node hash calculated from a partial key and an actual value
+    - subtree calculated from a set of key value having a common key part (this common key 
+    matches the depth of this elided content).
 
-| Tag | Name | Meaning | The proof ships |
-|---|---|---|---|
-| `B` | expanded branch | a branch whose two children are in the proof subtree | nothing |
-| `H` | hashed subtree | a non-empty subtree that is not opened | its hash |
-| `K` | known subtree | a subtree under which every state key is the key of an entry | nothing |
-| `R` | raw leaf | a leaf whose key is not the key of an entry | key suffix; value or value hash |
-
-A `K` under which no state key lies is an empty subtree. The verifier computes the hash of a `K` by
-rebuilding it from the entries under it.
-
-Together with the entries, a proof subtree proves that:
-
-- every entry is in the state: its key is present and holds its value;
-- the key of every `R` is present and holds its value, or a value with the shipped hash;
-- a key under a `K` is absent from the state unless it is the key of an entry;
-- a key under an `R` is absent from the state unless it is the key of the `R`.
-
-It proves nothing about a key under an `H`.
+Note that some value hash are inlined, in this case they are seen as a standard hash for elided
+subtree with hash and as a value node for elided subtree without hash.
 
 ## Encoding
 
@@ -89,31 +79,39 @@ The encoded proof consists of a version octet followed by four sections, with no
 lengths:
 
 ```
-proof      = version tags hashes raw_keys raw_values
-version    = 0x00
-tags       = subtree, then zero bits up to the next octet boundary
-subtree    = B subtree subtree | H | K | R
-hashes     = 32 octets per H, in tag order
-raw_keys   = for each R, in tag order, the last 248 - d bits of its key, d being its depth;
-             concatenated most significant bit first, then zero bits up to the next octet boundary
-raw_values = for each R, in tag order: one form octet, then its data
+proof              = version tags hashes raw_keys raw_values
+version            = 0x00
+sequences_sizes    = all size of the previous sequences.
+structure          = sequence of key contents, variable size order, aligned to bits, padded by 0
+structure_sizes    = sequence of key contents sizes in bits, each size is one byte and points to
+                     an elided subtree without hash.
+hashes             = sequence of attached elided subtree or value hashes. 32 octets per H, ordered.
 ```
 
 The `version` octet identifies the encoding defined here, version 0. Later revisions of this
 document may define further versions.
 
-The `tags` section lists the nodes of the proof subtree in pre-order: a `B` is followed by the tags
-of its left subtree and then those of its right subtree. This order is called tag order, and the
-other sections follow it.
+The `sequences_sizes` are compact size in bytes of each sequence in order.
 
-Each tag is two bits:
+The `structure` and `structure_sizes` sections lists all the tree path to descend into (from root
+to leaf) during the verification iteration.
 
-| Tag | Code |
-|---|---|
-| `B` | `00` |
-| `H` | `01` |
-| `K` | `10` |
-| `R` | `11` |
+If content to be proven is a present single key value, we shall therefore descend up to its value node hash (248
+bits minus its value node partial key length).
+
+If content to be proven is a missing single key value, we shall descend up to the first empty node
+(or not descend if the current stack is already on an empty node holding this key).
+
+If content to be proven is a subtree (generally from a range with start key equal to end key), then (unless 
+in a empty node holding the range), the depth is the depth of this range.
+
+The tree path to unstack (going up) after a descent is define by content to be proven, for instance, if last
+value or range, it will be the root (to verify root matching), between two consecutive keys it will
+be the common path.
+
+The `hashes` is a sequence of hash (aligned 32 bytes) of elided subtree that is not meant to be proven. It will be consumed
+and stacked during descent and unstacked to calculate parent branch hash when going up.
+
 
 Tags are packed from the most significant bits of each octet down. The first tag thus occupies bits
 7 and 6 of the first octet of the `tags` section.
@@ -125,134 +123,69 @@ The `hashes` section holds one 32-octet hash per `H`, in tag order. If the node 
 is a left child, its hash is encoded as the GP's branch encoding stores it: with bit 7 of octet 0
 cleared.
 
-The `raw_keys` section holds, for each `R` in tag order, the last $248 - d$ bits of its key, $d$
-being the depth of the `R`. The first $d$ bits of the key are the path to the `R`, so the key is
-that path followed by these bits. The suffixes are concatenated without padding between them. The
-section is padded with zero bits to an octet boundary at its end only. With no `R`, the section is
-empty.
-
-The `raw_values` section holds, for each `R` in tag order, a form octet and then its data. The form
-octet says what the data is:
-
-| Form octet | Data |
-|---|---|
-| `0` to `32` | the value itself, of that many octets |
-| `33` | the 32-octet hash of the value, which is longer than 32 octets |
-
-These are the two contents of a GP leaf node: the value itself when it has at most 32 octets, the
-hash of the value otherwise. Form octets from `34` to `255` are invalid.
-
-The section lengths follow from the tags. The `hashes` section holds 32 octets per `H`. The
-`raw_keys` section holds $\lceil \sum (248 - d) / 8 \rceil$ octets, the sum running over the `R`
-tags. The `raw_values` section takes the rest of the proof, and its form octets delimit it.
-
-## Canonical form
+## Verification
 
 A verifier must report a proof whose version octet is not 0 as having an unknown version. This is a
 distinct error from an invalid proof, so that a verifier can tell a later version from a corrupt
 proof.
 
-A verifier must reject a proof of version 0 if any of the following holds:
-
-1. The proof is empty, or the `tags` section ends before the subtree is complete.
-2. A padding bit of the `tags` section is set.
-3. A `B` is at depth 248 or deeper.
-4. A `B` has one of these pairs of children, in either order:
-   - two `H`;
-   - two `K`;
-   - a `K` under which no entry lies, and an `R`.
-5. An `H` carries the zero hash.
-6. An `H` that is a left child has bit 7 of octet 0 of its hash set.
-7. A padding bit of the `raw_keys` section is set.
-8. A form octet is greater than 33.
-9. The key of an `R` is the key of an entry.
-10. A section is shorter than its contents require, or octets remain after the data of the last
-    `R`.
-11. The verifier's entries are not in strictly ascending order of key.
-12. An entry lies under no `K`.
-13. The hash of the root of the proof subtree differs from the trusted state root.
-
-Rule 4 rejects branches that the rules under [Construction](#construction) never produce:
-
-- two `H`: construction rule 3 opens a branch only for a key that lies under one of its children,
-  and that child is then not an `H`;
-- two `K`: construction rule 2 makes such a branch a `K` itself;
-- an empty `K` and an `R`: the state trie has no such branch, because a node with one key under it
-  is a leaf.
-
-These rules give every proof subtree exactly one encoding. The verifier accepts any canonically
-encoded proof subtree whose root hash is the state root.
-
-The verifier does not check that the proof subtree is the one the construction rules give for a
-query. A proof may therefore open more of the trie than the query needs, which proves more keys,
-never fewer. The checks a verifier makes against its own query are listed under
-[Verification](#verification).
-
-A verifier may bound the size of the proofs it accepts.
-
-## Verification
-
 The verifier takes three inputs: the proof, a trusted state root, and its entries. While reading
 the tags in order, it keeps the path to the current node and a stack of open branches, those whose
-right child is still to come. Each slot of the stack is empty or holds a left child's tag and hash.
+right child is still to come. Each slot of the stack is holds an optional left child's hash.
+Stack is bounded to max tree depth in bits.
 
-Reading a `B` opens a branch: a slot is pushed and the left child is read next. When a node
-completes and the top slot is empty, the node is a left child. Its tag and hash are stored in the
-slot, and the right child is read next. When a node completes and the top slot already holds a left
-child, the node is the right child. The branch's hash is computed from the two, the slot is popped,
-and the branch is itself a completed node, to be handled the same way by the slot below. The proof
-is valid when the final completed node is the root of the proof subtree and its hash equals the
-state root:
+A verifier must reject a proof of version 0 if any of the following holds:
 
-    stack = empty, path = empty
+1. The calculated root from verification iteration do not match the expected root.
+2. The set data to be verified defines data that is not under an elided subtree without hash 
+3. The set of data to verify is not fully accessed during iteration.
+
+A verifier may bound the size of the proofs it accepts, in this case the the set of data to verify
+may not be fully cover, it is up to the protocol to define the subset of data that is covered
+(usually by simply returning the last key or subrange), and the proof is simply covering a smaller
+set that should be completed by other proofs to cover the full set. When splitting sets, there
+is no idea of partial proof, this is all full proofs of consecutive set: this allows checking
+root for every subset (the three previous criteria 1 can only be check after a full proof
+verification).
+
+
+The verification run as:
+
+    stack = empty, path = empty, missing_elided_hash = empty_hash, target_len = 0, common_depth_up = 0, proven_root = empty_hash
+    content_to_be_proven = consume first content to be proven
     loop:
-        tag = next tag
-        match tag:
-            B: push an empty slot; append 0 to path; continue
-            H: hash = next hash; path is not covered
-            K: S = the entries whose keys lie under path
-               hash = rebuild of S at depth (length of path)
-               the entries of S are consumed
-            R: key = path followed by the next 248 - (length of path) bits of raw_keys
-               (form, data) = next form octet and its data from raw_values
-               hash = hash of the leaf node of key and data
-               key is present
+        target_len = consume one bytes from structure_sizes and adds it to current length of path
         loop:
-            if stack is empty:
-                require hash = state root; done
-            if top of stack is empty:
-                top of stack = (tag, hash); set the last bit of path to 1; break
-            (left tag, left hash) = pop stack; remove the last bit of path
-            check rule 4 on (left tag, tag)
-            hash = hash of the branch node with children left hash and hash; tag = B
-    require every entry is consumed
+            if length of current path in bits equals to target_len
+               if content_to_be_proven matches current path
+                   missing_elided_hash = with current content_to_be_proven gets its hash (either partialkey and
+                   value hash) or full subtree of a range hash (in this case the current stack and path should be used)
+                else
+                    missing_elided_hash = empty_hash
+                break from loop
+            else
+               next_bit = consume one bit forme structure sequence
+               if next_bit equals 1
+                   consume one hash from hashes section and put it on stack 
+               else
+                   put no hash on stack (increase stack len but no content)
+            content_to_be_proven, common_depth_up = consume next content to be proven, and get common depth with
+            previous content to be proven (or 0 if last content). 
+        loop:
+            if stack length equals to common_depth_up
+               break from loop
+            unstack_item = pop from stack
+            if unstack item is defined
+                missing_elided_hash = hash of item from stack as left node and missing_elided_hash as right node
+            else
+                right_hash = consume one hash from hashes section
+                missing_elided_hash = hash of missing_elided_hash as left node and right_hash
+        if stack is empty:
+            proven_root = missing_elided_hash
+            break from loop
+    require proven_root to match expected state root
+    require every entry to be proven is consumed
     require every section is consumed exactly
-
-The pseudo-code omits the other canonical-form rules, which are checked as each tag, hash, key and
-value is read.
-
-For a `K`, the entries whose keys lie under the path form a contiguous part of the ascending
-entries, so the verifier can take them in order.
-
-For an `R`, the leaf node depends on the form octet:
-
-- form `0` to `32`: the leaf node embeds the data as the value;
-- form `33`: the leaf node holds the data as the hash of the value.
-
-The result of verification is the set of present keys and the set of paths of the `H` nodes. The
-present keys are:
-
-- the keys of the entries, with their values, and
-- the keys of the `R` leaves, each with its value or the hash of its value.
-
-A key is then:
-
-- Present, if it is a present key.
-- Absent, if it is not present and its path in the proof subtree ends at a `K` or at an `R` holding
-  a different key.
-- Not covered, otherwise. Its path leaves the proof subtree through an `H`.
-
-A verifier must treat a key that is not covered as a failed proof, never as an absent key.
 
 ## Proving a query
 
@@ -273,6 +206,14 @@ A query must satisfy the following, with bounds compared after padding:
 
 A prover must reject a query that violates these constraints.
 
+From the proof perspective, a listed key is expected a value hash (hash of partial key and value) or default to an empty hash in one of its parent branches (note that if empty hash exactly matches the key, then we add it to the hash section as there is no way to know if the key  is used from the structure).
+
+From the proof perspective, a range resolves from one to multiple subtree, that would be:
+
+- Any subtree contained in the range with no parent subtree contain in the range.
+    There for the content to be proven here would result in multiple contents. The subtree being known only during iteration over the proof, consuming next subtree here is dependant on the current path.
+    No parent criteria is simply enforce by going up at first met subtree, which is defaults.
+
 The entries of a query are the pairs of the state whose key is a listed key or lies within a range.
 The prover builds the proof subtree of the query with the rules under [Construction](#construction);
 its claims then include the presence of every entry, the absence of every listed key that is not in
@@ -280,184 +221,37 @@ the state, and the contents of every range.
 
 ### Construction
 
-The proof subtree follows only the paths relevant to the query. Starting at the root, the prover
-opens a branch into both children only when a listed key or a key within a range lies under it.
-Every other node it reaches gets a single tag, `K`, `R` or `H`, and is not opened further. For each
-node, the first of the following rules that applies gives the tag:
+Construction is done over a set of contents to prove (full keys to value or partial keys to subtree (range starting
+and ending at this partial key).
 
-1. If no state key lies under the node, the tag is `K`.
-2. If every state key under the node is the key of an entry, the tag is `K`.
-3. If a listed key lies under the node, or a key within a range lies under the node:
-   - if the node is a leaf, the tag is `R`;
-   - if the node is a branch, the tag is `B`, and the prover applies these rules to both children.
-4. Otherwise, the tag is `H`.
+We iterate on state alongside content to prove and feed the require sections, quite straight forward.
 
-Rule 3 tests keys of the whole key space: a listed key or a key within a range counts whether or
-not it is in the state.
+## Extension to self contained proof
 
-The following consequences hold:
+Query may not have all content but just a set of data to obtain alongside the proof.
 
-- For an empty state, the proof subtree is a single `K`.
-- For a non-empty state and a query with no listed keys and no ranges, the proof subtree is a
-  single `H` carrying the state root.
-- For a state with one key that is the key of an entry, the proof subtree is a single `K`.
-- For a query of one listed key that is present, the path of the key is a chain of `B` tags that
-  ends at a `K` at the key's leaf. Each sibling along the path is an `H`, or a `K` if it is empty.
-  Vector 1 shows this as `B H B H B K H`.
-- The path of a listed key that is absent from the state ends at one of:
-  - an empty `K`;
-  - a non-empty `K`, whose state keys are entries of other listed keys or of ranges;
-  - an `R` holding a different key.
-- A subtree whose state keys all lie within ranges is a single `K`, however many keys it holds.
-- A leaf whose key lies outside every range is an `R` when a key within a range lies under it.
-- Two listed keys whose paths end at the same leaf need no special rule. The leaf is a `K` if its
-  key is the key of an entry, and an `R` otherwise.
+### Query do not need values and knows keys.
 
-### Limiting a reply
+We attach hashes with the proof.
 
-A protocol may limit the size of a reply. The limit applies to the charged keys of the query, which
-are its listed keys and the keys of the state that lie within its ranges. Since the listed keys are
-sorted, the ranges are sorted and disjoint, and no listed key lies within a range, the charged keys
-form one ascending sequence. A range containing no key of the state adds no charged keys.
+#### node offset
 
-The charge of a charged key is the number of octets it adds to the reply:
+- bit hash type sequence:
+    - 0: an empty node
+    - 1: an attached node in next sequence
+- hashes sequence (all 32bytes).
 
-- a present key: $31$ plus the length of its value, the octets of its entry. This holds whether or
-  not the protocol sends the entry.
-- an absent key whose path ends at an `R`: $\lceil (248 - d) / 8 \rceil + 1$ plus the length of the
-  `R`'s value if it has at most 32 octets, or plus 32 otherwise, $d$ being the depth of the `R`.
-- an absent key whose path ends at a `K`: 0.
+### Providing values
 
-The charge is conservative. Key suffixes are packed without per-leaf padding, and two absent listed
-keys whose paths end at the same `R` are each charged for it. Hashes and tags are not charged.
+- bit hash type sequence:
+    - 0: a empty node
+    - 1: a attached bit sized partial key and a value
+- bit sized partial key and a value sequence (size as compact integer).
 
-The prover includes charged keys in order while their total charge stays within the limit. The
-first charged key is always included. If a charged key does not fit, the prover stops there and
-reports the last charged key it included, called the cut key. If every charged key fits, the prover
-reports that the reply is complete.
+### Query example
 
-The query cut at a key $k$ is a shorter query derived from the original:
+With query being a sequence of key and ranges. Key and ranges must b deduplicated (no key in ranges), and ordered.
 
-- it keeps the listed keys that do not exceed $k$;
-- it removes every range whose padded `start` exceeds $k$;
-- it ends every remaining range whose padded `end` exceeds $k$ at $k$.
-
-A truncated reply is not a special form of proof. Its entries and its proof are those of the query
-cut at the cut key. The verifier checks it as the reply to that query. A verifier that holds
-entries of its own must use only those of the cut query.
-
-A verifier may continue with a new query made of the listed keys that exceed the cut key and the
-parts of the ranges that lie after it.
-
-The cut cannot be inferred from the proof. A truncated proof may still cover the whole query,
-because an absent listed key can open the region the cut removed. The completeness and the cut key
-reported by the prover are authoritative.
-
-### Checking a reply against the query
-
-A verifier that checks a proof against a query it made must also check that the claims of the proof
-cover the query:
-
-- no `H` stands for a node under which a listed key lies;
-- no `H` stands for a node under which a key within a range lies;
-- no `R` holds a listed key or a key within a range.
-
-The first check is the lookup of each listed key. The second is needed because the verifier cannot
-look up the keys of a range one by one: such an `H` could hide keys of the range, which would then
-be neither present nor absent. The third is needed because such an `R` would prove a requested key
-without delivering it as an entry, and might ship only the hash of its value.
-
-## Test vectors
-
-These vectors use a state of five keys, named by their first three bits: `000`, `001`, `100`, `110`
-and `111`. Octet 0 of each key is those three bits followed by `11010`, and octets 1 to 30 are
-`0x5A`; key `110` is thus `0xDA` followed by thirty `0x5A` octets. The value under each key is the
-nine octets of the ASCII string `value ` followed by the key's three bits, e.g. `value 110`. The
-state root is `9b9760b1a0bbb685177ad5ddd98b1ae446307255aca511c22e4c2e778cec425f`.
-
-The hashes used below, as they appear in the `hashes` section, are those of the leaves holding
-keys `000`, `100`, `110` and `111`, and of the subtrees under the paths `0` (keys `000` and `001`),
-`00` (the same two keys) and `11` (keys `110` and `111`):
-
-    leaf 000     40f3854ff47a42a159d21e8275e15df4937d19063426e38cfdc30878dbc22ea6
-    leaf 100     6b177808b75d08e8e68fc330d42ebdda1eadbd804db18d1e4679cbcb349c52df
-    leaf 110     2af306b851cf153d7c58cf43682fed3b75f2cdd7dfc9a547dcfe990ccaea77ab
-    leaf 111     883a0c1f05cbac875dae2e53c5c15dfad106d7272bf3cb07015aae7e8656f7f9
-    subtree 0    50918ec4ad4465ee3baa8a272129bd2534ad911f63d22abff4716baa78bc97c3
-    subtree 00   41dd8fddabce96f7a9e0b737297a41b55924bb4e5e7c7e2f0772ef948a60debd
-    subtree 11   4edb3501f7717e134d548ba9825c4e98a8fe174ec15b2d51667d3688dca3f7e9
-
-Subtree `0` is a left child, so its hash appears with bit 7 of octet 0 cleared; its full hash
-starts with `d0`. The other hashes have that bit clear already.
-
-Each proof is shown in hex, followed by its version octet, tags, hashes, raw keys and raw values,
-separated by `|`. The hex is the concatenation of these components.
-
-1. Listed key `110`. Entries: `110`. Tags `B H B H B K H`. Hashes: subtree 0, leaf 100, leaf 111.
-   No raw leaves.
-
-       00112450918ec4ad4465ee3baa8a272129bd2534ad911f63d22abff4716baa78bc97c36b177808b75d08e8e68fc330d42ebdda1eadbd804db18d1e4679cbcb349c52df883a0c1f05cbac875dae2e53c5c15dfad106d7272bf3cb07015aae7e8656f7f9
-
-   `00` | `1124` = 7 tags and 2 padding bits | subtree 0, leaf 100, leaf 111 | none | none
-
-2. Listed keys `001` and `111`. Entries: `001`, `111`. Tags `B B B H K K B H B H K`. Hashes: leaf
-   000, leaf 100, leaf 110. No raw leaves.
-
-       0001a11840f3854ff47a42a159d21e8275e15df4937d19063426e38cfdc30878dbc22ea66b177808b75d08e8e68fc330d42ebdda1eadbd804db18d1e4679cbcb349c52df2af306b851cf153d7c58cf43682fed3b75f2cdd7dfc9a547dcfe990ccaea77ab
-
-   `00` | `01a118` = 11 tags and 2 padding bits | leaf 000, leaf 100, leaf 110 | none | none
-
-   The `K` at path `001` rebuilds to the leaf of `001`, and the `K` at path `01` is an empty
-   subtree.
-
-3. Range `[001, 110]`, both bounds being full keys. Entries: `001`, `100`, `110`. Tags
-   `B B B H K K B K B K H`. Hashes: leaf 000, leaf 111. No raw leaves.
-
-       0001a22440f3854ff47a42a159d21e8275e15df4937d19063426e38cfdc30878dbc22ea6883a0c1f05cbac875dae2e53c5c15dfad106d7272bf3cb07015aae7e8656f7f9
-
-   `00` | `01a224` = 11 tags and 2 padding bits | leaf 000, leaf 111 | none | none
-
-4. Range `[100, 111]`, both bounds being full keys. Its state keys, `100`, `110` and `111`, are
-   exactly the keys under path `1`. Entries: `100`, `110`, `111`. Tags `B H K`. Hashes: subtree 0.
-   No raw leaves.
-
-       001850918ec4ad4465ee3baa8a272129bd2534ad911f63d22abff4716baa78bc97c3
-
-   `00` | `18` = 3 tags and 2 padding bits | subtree 0 | none | none
-
-   The whole subtree under path `1` is a single `K`. The proof would stay this size for any number
-   of keys under that path.
-
-5. Listed keys `010` and `101`, both absent. No entries. Tags `B B H K B R H`. Hashes: subtree 00,
-   subtree 11. Raw leaf: key `100` at depth 2, value `value 100`.
-
-       00063441dd8fddabce96f7a9e0b737297a41b55924bb4e5e7c7e2f0772ef948a60debd4edb3501f7717e134d548ba9825c4e98a8fe174ec15b2d51667d3688dca3f7e9696969696969696969696969696969696969696969696969696969696969680976616c756520313030
-
-   `00` | `0634` = 7 tags and 2 padding bits | subtree 00, subtree 11 | key `100` minus its first 2
-   bits: 246 bits and 2 padding bits = 31 octets | `09` `value 100`
-
-   Key `010` is absent because its path ends at the empty `K` at path `01`. Key `101` is absent
-   because its path ends at the `R` at path `10`, which holds key `100`.
-
-6. The empty state, any query. No entries. Tags `K`. No hashes. No raw leaves. The state root is
-   the zero hash.
-
-       0080
-
-   `00` | `80` = 1 tag and 6 padding bits | none | none | none
-
-7. The five-key state, a query with no listed keys and no ranges. No entries. Tags `H`. Hashes: the
-   state root. No raw leaves.
-
-       00409b9760b1a0bbb685177ad5ddd98b1ae446307255aca511c22e4c2e778cec425f
-
-   `00` | `40` = 1 tag and 6 padding bits | the state root | none | none
-
-8. A state holding only key `110`, listed key `110`. Entries: `110`. Tags `K`. No hashes. No raw
-   leaves. The state root is the hash of leaf 110.
-
-       0080
-
-   `00` | `80` = 1 tag and 6 padding bits | none | none | none
-
-   This proof is the same as in vector 6. The entries and the state root differ.
+key should match an elided node, one and only one if there is a value attached, or an added empty node on the path.
+range, from starting key to end key resolved to one elided set of node if start key equal to end key or to two elided set of node (start to common prefix, common prefix to end, with common prefix between start and end).
+Again elided sets of node must match those of the proof (or have an empty node in their path).
